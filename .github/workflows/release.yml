@@ -8,7 +8,9 @@
 #             so a failed platform never reaches the update feed.
 #   Test:     push a branch named test-<something> to the source repo and the same name as a tag
 #             here, e.g. test-release-1.0.5: the three builds run and nothing is published.
-#   Feed:     Actions tab → Run workflow with an existing tag rebuilds only its latest.json.
+#   Finish:   Actions tab → Run workflow with a tag (e.g. v1.0.5) runs only the last job: merge the
+#             drafts, release notes, latest.json, publish. Use it when the builds succeeded and only
+#             that job failed.
 #
 # Secrets: SOURCE_DEPLOY_KEY (read-only deploy key of the source repo), TAURI_SIGNING_PRIVATE_KEY
 # (updater signing key, no password). The Supabase URL and anon key are public by design.
@@ -21,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Only rebuild latest.json for this existing release (e.g. v1.0.5)"
+        description: "Finish this release: notes, latest.json, publish (e.g. v1.0.5)"
         required: true
 
 permissions:
@@ -147,14 +149,16 @@ jobs:
       TAG: ${{ inputs.tag || github.ref_name }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      # The scripts and CHANGELOG come from the source's main branch (the newest scripts; the
+      # CHANGELOG section for this version is there too).
       - name: Source scripts (private repo, read-only key)
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: main
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
 
-      - name: Merge stray drafts for this tag into one
+      - name: Merge stray drafts for this tag into one (sets REL_ID)
         run: scripts/merge-drafts.sh "$TAG"
 
       - name: Release notes from CHANGELOG.md → release body
@@ -162,7 +166,7 @@ jobs:
           set -euo pipefail
           notes=$(node scripts/release-notes.mjs "$TAG")
           api=https://api.github.com/repos/${{ github.repository }}
-          id=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "$api/releases?per_page=30" | jq -r --arg t "$TAG" '[.[] | select(.tag_name == $t)][0].id')
+          id="$REL_ID"
           jq -n --arg b "$notes" '{body: $b}' | curl -sf -X PATCH -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" --data-binary @- "$api/releases/$id" >/dev/null
           echo "release body set from CHANGELOG.md ($(wc -l <<<"$notes") lines)"
 
@@ -170,10 +174,10 @@ jobs:
         run: scripts/updater-feed.sh "$TAG"
 
       - name: Publish the release (it was a draft until every asset was in)
-        if: github.event_name == 'push'
         run: |
           set -euo pipefail
           api=https://api.github.com/repos/${{ github.repository }}
-          id=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "$api/releases?per_page=30" | jq -r --arg t "$TAG" '[.[] | select(.tag_name == $t)][0].id')
-          curl -sf -X PATCH -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" -d '{"draft": false, "make_latest": "true"}' "$api/releases/$id" >/dev/null
-          echo "release $TAG published"
+          jq -n --arg t "$TAG" '{tag_name: $t, draft: false, prerelease: false, make_latest: "true"}' \
+            | curl -sf -X PATCH -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" --data-binary @- "$api/releases/$REL_ID" >/dev/null
+          echo "release $TAG published (id $REL_ID)"
+          curl -sfL "https://github.com/${{ github.repository }}/releases/latest/download/latest.json" | jq -r '"update feed now says " + .version'
