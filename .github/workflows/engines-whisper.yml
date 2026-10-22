@@ -1,0 +1,177 @@
+# Lives in the public GrabNConvert-releases repo, where GitHub-hosted runners are free, and publishes
+# into this same repo with its own GITHUB_TOKEN. The app's engines.lock.json pins the zips.
+#
+# Build whisper.cpp's `whisper-cli` (the Subtitles engine) for macOS Apple Silicon (Metal), macOS
+# Intel and Windows from one pinned whisper.cpp commit, test each on a real sample, and publish the
+# three zips as a pre-release here. Every build is a single
+# self-contained program: ggml linked in statically, no OpenMP, the C runtime linked in on Windows,
+# only system frameworks on macOS.
+#
+# Run it by pushing a tag like `engines-whisper-0c7be69` (the whisper.cpp commit after the last dash),
+# or from the Actions tab with the commit as input.
+
+name: engines-whisper
+
+on:
+  push:
+    tags: ["engines-whisper-*"]
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "whisper.cpp commit to build, e.g. 0c7be69"
+        required: true
+        default: "0c7be69"
+
+permissions:
+  contents: read
+
+env:
+  COMMIT_INPUT: ${{ inputs.commit || github.ref_name }}
+  # Common CMake switches: static ggml, only the whisper-cli example, no SDL/curl, no OpenMP runtime.
+  CMAKE_COMMON: >-
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DWHISPER_BUILD_TESTS=OFF
+    -DWHISPER_BUILD_EXAMPLES=ON -DWHISPER_BUILD_SERVER=OFF -DWHISPER_SDL2=OFF -DWHISPER_CURL=OFF
+    -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-14
+            exe: whisper-cli
+            cmake: -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON
+          - name: macos-x64
+            os: macos-15-intel
+            exe: whisper-cli
+            cmake: -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 -DGGML_METAL=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
+          - name: windows-x64
+            os: windows-latest
+            exe: whisper-cli.exe
+            cmake: -A x64 -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Resolve the commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          short="${COMMIT_INPUT#engines-whisper-}"
+          full=$(curl -sf -H "Accept: application/vnd.github+json" "https://api.github.com/repos/ggml-org/whisper.cpp/commits/$short" | jq -r .sha)
+          test -n "$full" && test "$full" != null
+          echo "SHORT=$short" >> "$GITHUB_ENV"
+          echo "FULL=$full" >> "$GITHUB_ENV"
+          echo "whisper.cpp $short = $full"
+
+      - name: Fetch the source
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o src.tar.gz "https://codeload.github.com/ggml-org/whisper.cpp/tar.gz/$FULL"
+          mkdir src && tar xzf src.tar.gz -C src --strip-components=1
+
+      - name: Build whisper-cli
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S src -B build $CMAKE_COMMON ${{ matrix.cmake }}
+          cmake --build build --config Release --target whisper-cli -j 4
+          exe=$(find build/bin -name "${{ matrix.exe }}" -type f | head -1)
+          test -n "$exe"
+          mkdir -p "pkg"
+          cp "$exe" "pkg/${{ matrix.exe }}"
+          cp src/LICENSE pkg/LICENSE
+          ls -la pkg
+
+      - name: Check it needs nothing but the system
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            file pkg/whisper-cli
+            otool -L pkg/whisper-cli
+            if otool -L pkg/whisper-cli | tail -n +2 | grep -v -E "^\s+(/System/Library/|/usr/lib/)"; then
+              echo "links something outside macOS"; exit 1
+            fi
+          else
+            # dumpbin lists the DLLs it loads: Windows system DLLs only (no VCRUNTIME, no vcomp, no ggml).
+            vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+            vs=$("$vswhere" -latest -property installationPath)
+            dumpbin=$(find "$vs/VC/Tools/MSVC" -path "*Hostx64/x64/dumpbin.exe" | head -1)
+            "$dumpbin" //dependents pkg/whisper-cli.exe | tee deps.txt
+            if grep -i -E "vcruntime|msvcp|vcomp|ggml|whisper\.dll" deps.txt; then
+              echo "needs a DLL that Windows does not ship"; exit 1
+            fi
+          fi
+
+      - name: Smoke test on the sample (tiny English model)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o tiny.bin "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin"
+          ./pkg/${{ matrix.exe }} --version 2>&1 | head -3 || true
+          ./pkg/${{ matrix.exe }} -m tiny.bin -f src/samples/jfk.wav -otxt -of out -np
+          cat out.txt
+          grep -i "ask not what your country" out.txt
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          name="whisper-${SHORT}-${{ matrix.name }}.zip"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            (cd pkg && 7z a -tzip "../out/$name" "${{ matrix.exe }}" LICENSE >/dev/null)
+            sha=$(sha256sum "out/$name" | cut -d' ' -f1)
+          else
+            (cd pkg && zip -q -X "../out/$name" "${{ matrix.exe }}" LICENSE)
+            sha=$(shasum -a 256 "out/$name" | cut -d' ' -f1)
+          fi
+          echo "$sha  $name" | tee "out/$name.sha256"
+          echo "\`$sha  $name\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisper-${{ matrix.name }}
+          path: out/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: Publish to this repo's releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          short="${COMMIT_INPUT#engines-whisper-}"
+          cat out/*.sha256 > out/SHA256SUMS
+          cat out/SHA256SUMS
+          api=https://api.github.com/repos/${{ github.repository }}
+          auth="Authorization: Bearer $GH_TOKEN"
+          tag="engines-whisper-${short}"
+          sha=$(curl -sf -H "$auth" "$api/git/ref/heads/main" | jq -r .object.sha)
+          code=$(curl -s -o /tmp/tag.json -w '%{http_code}' -X POST -H "$auth" "$api/git/refs" -d "{\"ref\":\"refs/tags/$tag\",\"sha\":\"$sha\"}")
+          case "$code" in 201|422) ;; *) cat /tmp/tag.json; exit 1;; esac
+          id=$(curl -s -H "$auth" "$api/releases/tags/$tag" | jq -r '.id // empty')
+          if [ -z "$id" ]; then
+            body="whisper.cpp ${short} (whisper-cli) for GrabNConvert's Subtitles page: macOS Apple Silicon (Metal), macOS Intel, Windows x64. MIT; source: https://github.com/ggml-org/whisper.cpp/tree/${short}"
+            curl -sf -o /tmp/rel.json -X POST -H "$auth" "$api/releases" -d "{\"tag_name\":\"$tag\",\"name\":\"Engine: whisper.cpp ${short}\",\"body\":\"$body\",\"draft\":false,\"prerelease\":true}"
+            id=$(jq -r .id /tmp/rel.json)
+          fi
+          for f in out/*.zip out/SHA256SUMS; do
+            name=$(basename "$f")
+            old=$(curl -s -H "$auth" "$api/releases/$id/assets?per_page=100" | jq -r --arg n "$name" '.[] | select(.name == $n) | .id')
+            [ -z "$old" ] || curl -sf -X DELETE -H "$auth" "$api/releases/assets/$old" >/dev/null
+            curl -sf -X POST -H "$auth" -H "Content-Type: application/octet-stream" --data-binary "@$f" \
+              "https://uploads.github.com/repos/${{ github.repository }}/releases/$id/assets?name=$name" >/dev/null
+            echo "uploaded $name"
+          done
