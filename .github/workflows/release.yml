@@ -1,0 +1,179 @@
+# Build GrabNConvert for macOS (Apple Silicon, Intel) and Windows and publish the release here.
+# It runs in this public repo because GitHub-hosted runners are free for public repos; the app's
+# source stays private and is checked out with a read-only deploy key (secret SOURCE_DEPLOY_KEY).
+# Build logs are public; they hold compiler output, never the source or a secret.
+#
+#   Release:  push the tag v1.2.3 to the source repo AND to this repo. The source is built at that
+#             tag; the draft release here becomes public only when all three platforms succeeded,
+#             so a failed platform never reaches the update feed.
+#   Test:     push a branch named test-<something> to the source repo and the same name as a tag
+#             here, e.g. test-release-1.0.5: the three builds run and nothing is published.
+#   Feed:     Actions tab → Run workflow with an existing tag rebuilds only its latest.json.
+#
+# Secrets: SOURCE_DEPLOY_KEY (read-only deploy key of the source repo), TAURI_SIGNING_PRIVATE_KEY
+# (updater signing key, no password). The Supabase URL and anon key are public by design.
+
+name: release
+
+on:
+  push:
+    tags: ["v*", "test-*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Only rebuild latest.json for this existing release (e.g. v1.0.5)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_REPO: itsmonirulislam/GrabNConvert
+  IS_TEST: ${{ startsWith(github.ref_name, 'test-') }}
+  # A release builds the source at its own tag; a test builds the source branch of the same name.
+  SOURCE_REF: ${{ startsWith(github.ref_name, 'test-') && format('refs/heads/{0}', github.ref_name) || github.ref_name }}
+  VITE_SUPABASE_URL: https://ncyxewoobvahtpgbrvkc.supabase.co
+  VITE_SUPABASE_ANON_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5jeXhld29vYnZhaHRwZ2JydmtjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTE2ODUyODUsImV4cCI6MjEwNzI2MTI4NX0.shICZ3aca3EVKL5aI6Y0r8XRfLUqzjCTHQqEwOgcBEA
+
+jobs:
+  prepare:
+    if: github.event_name == 'push' && startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    outputs:
+      id: ${{ steps.rel.outputs.id }}
+    steps:
+      - name: Draft release for the tag
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          api=https://api.github.com/repos/${{ github.repository }}
+          auth="Authorization: Bearer $GH_TOKEN"
+          id=$(curl -sf -H "$auth" "$api/releases?per_page=50" | jq -r --arg t "$TAG" '[.[] | select(.tag_name == $t)][0].id // empty')
+          if [ -z "$id" ]; then
+            version="${TAG#v}"
+            body="Installers for macOS (Apple Silicon and Intel) and Windows. Installed apps update by themselves."
+            id=$(curl -sf -X POST -H "$auth" "$api/releases" -d "{\"tag_name\":\"$TAG\",\"name\":\"GrabNConvert $version\",\"body\":\"$body\",\"draft\":true,\"prerelease\":false}" | jq -r .id)
+          fi
+          echo "release id $id"
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    # Runs for a release (after prepare) and for a test (prepare is skipped then).
+    if: always() && github.event_name == 'push' && (needs.prepare.result == 'success' || startsWith(github.ref_name, 'test-'))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            platform: macos-arm64
+            args: --config src-tauri/tauri.macos-arm64.conf.json
+          - os: macos-15
+            platform: macos-x64
+            args: --target x86_64-apple-darwin --config src-tauri/tauri.macos-x64.conf.json
+          - os: windows-latest
+            platform: windows-x64
+            args: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Source (private repo, read-only key)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-x64' && 'x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Fetch and verify media engines
+        run: node scripts/prepare-engines.mjs --platform ${{ matrix.platform }}
+
+      - name: Unit tests (frontend)
+        run: npm test
+
+      - name: Unit + end-to-end tests (Rust, real engines, no network)
+        working-directory: src-tauri
+        run: cargo test --lib --test ffmpeg_real --test queue_real
+
+      - name: Build only (test run)
+        if: env.IS_TEST == 'true'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx tauri build ${{ matrix.args }}
+          ls -R src-tauri/target/release/bundle src-tauri/target/*/release/bundle 2>/dev/null | grep -E "\.(dmg|exe|tar\.gz|sig|app)$" || true
+
+      - name: Build, sign and upload to the draft release
+        if: env.IS_TEST != 'true'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        with:
+          owner: itsmonirulislam
+          repo: GrabNConvert-releases
+          releaseId: ${{ needs.prepare.outputs.id }}
+          includeUpdaterJson: true
+          args: ${{ matrix.args }}
+
+  # Publishes only when every platform built. latest.json is rebuilt once from the assets that
+  # are really there (the three platform jobs race on it).
+  feed:
+    needs: build
+    if: always() && ((github.event_name == 'push' && startsWith(github.ref_name, 'v') && needs.build.result == 'success') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Source scripts (private repo, read-only key)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.tag || github.ref_name }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+
+      - name: Merge stray drafts for this tag into one
+        run: scripts/merge-drafts.sh "$TAG"
+
+      - name: Release notes from CHANGELOG.md → release body
+        run: |
+          set -euo pipefail
+          notes=$(node scripts/release-notes.mjs "$TAG")
+          api=https://api.github.com/repos/${{ github.repository }}
+          id=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "$api/releases?per_page=30" | jq -r --arg t "$TAG" '[.[] | select(.tag_name == $t)][0].id')
+          jq -n --arg b "$notes" '{body: $b}' | curl -sf -X PATCH -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" --data-binary @- "$api/releases/$id" >/dev/null
+          echo "release body set from CHANGELOG.md ($(wc -l <<<"$notes") lines)"
+
+      - name: Rebuild latest.json from the release assets
+        run: scripts/updater-feed.sh "$TAG"
+
+      - name: Publish the release (it was a draft until every asset was in)
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          api=https://api.github.com/repos/${{ github.repository }}
+          id=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "$api/releases?per_page=30" | jq -r --arg t "$TAG" '[.[] | select(.tag_name == $t)][0].id')
+          curl -sf -X PATCH -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" -d '{"draft": false, "make_latest": "true"}' "$api/releases/$id" >/dev/null
+          echo "release $TAG published"
