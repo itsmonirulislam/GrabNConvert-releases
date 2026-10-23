@@ -46,36 +46,40 @@ for _, dst in names:
     print(dst, round((OUT / dst).stat().st_size / 1e6, 1), "MB")
 print("weights.bin", round((OUT / "weights.bin").stat().st_size / 1e6, 1), "MB")
 
-# Tokenizer: the model's ids come from vocab.json; the pieces and scores from the SentencePiece model.
+# Tokenizer: M2M100's SentencePiece model is a BPE model (its piece scores are merge ranks, not
+# log-probabilities), so build a BPE tokenizer the way transformers' slow→fast converter does, then
+# renumber it in the model's own id order (vocab.json, then the language tokens).
 from transformers import M2M100Tokenizer
+from transformers.convert_slow_tokenizer import SentencePieceExtractor
 tok = M2M100Tokenizer.from_pretrained(MODEL)
-import sentencepiece.sentencepiece_model_pb2 as spm_pb
-proto = spm_pb.ModelProto()
-proto.ParseFromString(open(tok.spm_file, "rb").read())
-scores = {p.piece: p.score for p in proto.pieces}
+sp_vocab, merges = SentencePieceExtractor(tok.spm_file).extract()
 vocab = json.load(open(tok.vocab_file))  # token -> id (model ids)
-by_id = sorted(vocab.items(), key=lambda kv: kv[1])
-assert [i for _, i in by_id] == list(range(len(by_id))), "vocab ids are not dense"
 added = json.load(open(work / "added_tokens.json"))  # language tokens, ids after the vocab
-assert sorted(added.values()) == list(range(len(by_id), len(by_id) + len(added))), "added token ids are not dense"
-vocab.update(added)
+assert sorted(added.values()) == list(range(len(vocab), len(vocab) + len(added))), "added token ids are not dense"
 import tokenizers
-from tokenizers import Tokenizer, models, normalizers, pre_tokenizers, decoders, processors
-pieces = [(piece, scores.get(piece, -100.0)) for piece, _ in by_id]
-unk_id = vocab["<unk>"]
-tk = Tokenizer(models.Unigram(pieces, unk_id=unk_id, byte_fallback=False))
+from tokenizers import Tokenizer, models, normalizers, pre_tokenizers, decoders, AddedToken
+missing = [p for p in sp_vocab if p not in vocab]
+print("pieces not in the model's vocab:", len(missing), missing[:5])
+bpe_vocab = {t: i for t, i in vocab.items()}
+merges = [(a, b) for a, b in merges if a in bpe_vocab and b in bpe_vocab and a + b in bpe_vocab]
+tk = Tokenizer(models.BPE(vocab=bpe_vocab, merges=merges, unk_token="<unk>", fuse_unk=True, byte_fallback=False))
 tk.normalizer = normalizers.Sequence([normalizers.Nmt(), normalizers.NFKC(), normalizers.Replace(tokenizers.Regex(r" {2,}"), " ")])
 tk.pre_tokenizer = pre_tokenizers.Metaspace(replacement="▁", prepend_scheme="always", split=True)
 tk.decoder = decoders.Metaspace(replacement="▁", prepend_scheme="always", split=True)
-# Language tokens are whole tokens, never split.
-from tokenizers import AddedToken
-# Added tokens get ids after the vocab in the order they are added, so add them in id order.
-tk.add_special_tokens([AddedToken(t, special=True) for t in ["<s>", "<pad>", "</s>", "<unk>"]])
 for t, _ in sorted(added.items(), key=lambda kv: kv[1]):
     tk.add_special_tokens([AddedToken(t, special=True)])
+tk.add_special_tokens([AddedToken(t, special=True) for t in ["<s>", "<pad>", "</s>", "<unk>"]])
 for t in ["<s>", "<pad>", "</s>", "<unk>"] + list(added):
-    assert tk.token_to_id(t) == vocab[t], (t, tk.token_to_id(t), vocab[t])
+    assert tk.token_to_id(t) == vocab.get(t, added.get(t)), (t, tk.token_to_id(t))
+vocab.update(added)
 langs = sorted(t.strip("_") for t in added)
+# The ids must match the reference tokenizer exactly, on several scripts.
+for src, text in [("en", "The meeting moved to Thursday at 5 pm."), ("en", "Good morning everyone, thanks for coming!"), ("bn", "আগামীকাল সকালে অফিসে আসবেন।"), ("hi", "निकटतम रेलवे स्टेशन कहाँ है?"), ("ja", "明日の朝、オフィスに来てください。"), ("de", "Schönen Tag noch – bis später!"), ("en", "Email me at a.b@example.com, it's 10:30am.")]:
+    tok.src_lang = src
+    ref = tok(text).input_ids
+    mine = [vocab[f"__{src}__"]] + tk.encode(text).ids + [vocab["</s>"]]
+    assert ref == mine, (text, tok.convert_ids_to_tokens(ref), [tk.id_to_token(i) for i in mine])
+print("tokenizer matches the reference")
 tk.save(str(OUT / "tokenizer.json"))
 json.dump({"languages": langs, "eos": vocab["</s>"], "pad": vocab["<pad>"], "bos": vocab["<s>"], "unk": vocab["<unk>"]}, open(OUT / "languages.json", "w"), indent=1)
 
