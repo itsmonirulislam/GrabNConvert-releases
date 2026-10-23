@@ -1,0 +1,84 @@
+# Lives in the public GrabNConvert-releases repo, where GitHub-hosted runners are free, and publishes
+# into this same repo with its own GITHUB_TOKEN. The app pins each file's size and SHA-256.
+#
+# Export facebook/m2m100_418M (MIT) to ONNX and quantise it to int8 with pinned Python packages
+# (scripts/export_m2m100.py), check a few translations through ONNX Runtime, and publish the model
+# files as a pre-release here: the Subtitles page's translation engine.
+#
+# Run it by pushing a tag like `translate-m2m100-1` (a rerun can add `-r2`, which is dropped), or
+# from the Actions tab.
+
+name: engines-m2m100
+
+on:
+  push:
+    tags: ["translate-m2m100-*"]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Release tag to publish into, e.g. translate-m2m100-1"
+        required: true
+        default: "translate-m2m100-1"
+
+permissions:
+  contents: write
+
+env:
+  TAG_INPUT: ${{ inputs.release || github.ref_name }}
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install the pinned packages
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install "torch==2.8.0" --index-url https://download.pytorch.org/whl/cpu
+          pip install "transformers==4.57.6" "optimum[exporters,onnxruntime]==2.1.0" "onnxruntime==1.19.2" "onnx==1.19.1" "tokenizers==0.22.2" "sentencepiece==0.2.2" "numpy==2.0.2" "protobuf==6.33.6"
+
+      - name: Export, quantise and check
+        run: |
+          set -euo pipefail
+          python -I scripts/export_m2m100.py out
+          ls -la out
+          rm -rf out/fp32 out/q
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd out
+          sha256sum encoder.onnx decoder.onnx decoder_past.onnx weights.bin tokenizer.json languages.json | tee SHA256SUMS
+          for f in encoder.onnx decoder.onnx decoder_past.onnx weights.bin tokenizer.json languages.json; do echo "$f $(stat -c %s "$f") bytes"; done
+
+      - name: Publish to this repo's releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${TAG_INPUT%%-r[0-9]*}"
+          api=https://api.github.com/repos/${{ github.repository }}
+          auth="Authorization: Bearer $GH_TOKEN"
+          sha=$(curl -sf -H "$auth" "$api/git/ref/heads/main" | jq -r .object.sha)
+          code=$(curl -s -o /tmp/tag.json -w '%{http_code}' -X POST -H "$auth" "$api/git/refs" -d "{\"ref\":\"refs/tags/$tag\",\"sha\":\"$sha\"}")
+          case "$code" in 201|422) ;; *) cat /tmp/tag.json; exit 1;; esac
+          id=$(curl -s -H "$auth" "$api/releases/tags/$tag" | jq -r '.id // empty')
+          if [ -z "$id" ]; then
+            body="M2M100-418M (Meta AI, MIT) exported to ONNX and quantised to int8 for GrabNConvert's subtitle translation. Source: https://huggingface.co/facebook/m2m100_418M · export: scripts/export_m2m100.py"
+            curl -sf -o /tmp/rel.json -X POST -H "$auth" "$api/releases" -d "{\"tag_name\":\"$tag\",\"name\":\"Engine: M2M100 translation model\",\"body\":\"$body\",\"draft\":false,\"prerelease\":true}"
+            id=$(jq -r .id /tmp/rel.json)
+          fi
+          for f in out/encoder.onnx out/decoder.onnx out/decoder_past.onnx out/weights.bin out/tokenizer.json out/languages.json out/SHA256SUMS; do
+            name=$(basename "$f")
+            old=$(curl -s -H "$auth" "$api/releases/$id/assets?per_page=100" | jq -r --arg n "$name" '.[] | select(.name == $n) | .id')
+            [ -z "$old" ] || curl -sf -X DELETE -H "$auth" "$api/releases/assets/$old" >/dev/null
+            curl -sf -X POST -H "$auth" -H "Content-Type: application/octet-stream" --data-binary "@$f" \
+              "https://uploads.github.com/repos/${{ github.repository }}/releases/$id/assets?name=$name" >/dev/null
+            echo "uploaded $name"
+          done
