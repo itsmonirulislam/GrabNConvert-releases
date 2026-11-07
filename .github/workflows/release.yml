@@ -181,6 +181,52 @@ jobs:
           includeUpdaterJson: true
           args: ${{ matrix.args }}
 
+      # Tauri notarises the app inside the DMG but not the DMG itself. Apple asks for the disk image
+      # to be notarised too, so each DMG goes to the notary, gets its ticket stapled, and (for a
+      # release) replaces the copy tauri-action uploaded. Runs only when the Developer ID step set
+      # the APPLE_* values.
+      - name: Notarise the DMG (macOS)
+        if: runner.os == 'macOS' && env.APPLE_ID != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          found=0
+          while IFS= read -r dmg; do
+            found=1
+            echo "notarising $dmg"
+            xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait --timeout 30m --output-format json > "$RUNNER_TEMP/notary.json"
+            status=$(jq -r .status "$RUNNER_TEMP/notary.json")
+            id=$(jq -r .id "$RUNNER_TEMP/notary.json")
+            echo "notary $id: $status"
+            if [ "$status" != "Accepted" ]; then
+              xcrun notarytool log "$id" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" || true
+              exit 1
+            fi
+            xcrun stapler staple "$dmg"
+            spctl -a -t open --context context:primary-signature -vv "$dmg"
+            echo "$dmg" >> "$RUNNER_TEMP/dmgs.txt"
+          done < <(find src-tauri/target -path '*/bundle/dmg/*.dmg' -type f)
+          [ "$found" = 1 ] || { echo "no DMG was built"; exit 1; }
+
+      - name: Replace the DMG on the draft release (macOS)
+        if: runner.os == 'macOS' && env.APPLE_ID != '' && env.IS_TEST != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.prepare.outputs.id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          api=https://api.github.com/repos/${{ github.repository }}
+          auth="Authorization: Bearer $GH_TOKEN"
+          while IFS= read -r dmg; do
+            name=$(basename "$dmg")
+            old=$(curl -sf -H "$auth" "$api/releases/$RELEASE_ID/assets?per_page=100" | jq -r --arg n "$name" '.[] | select(.name == $n) | .id')
+            if [ -n "$old" ]; then curl -sf -X DELETE -H "$auth" "$api/releases/assets/$old"; fi
+            curl -sf -X POST -H "$auth" -H "Content-Type: application/x-apple-diskimage" --data-binary @"$dmg" \
+              "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=$name" > /dev/null
+            echo "uploaded the notarised $name"
+          done < "$RUNNER_TEMP/dmgs.txt"
+
   # Publishes only when every platform built. latest.json is rebuilt once from the assets that
   # are really there (the three platform jobs race on it).
   feed:
