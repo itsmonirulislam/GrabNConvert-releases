@@ -202,7 +202,13 @@ jobs:
               xcrun notarytool log "$id" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" || true
               exit 1
             fi
-            xcrun stapler staple "$dmg"
+            # Stapling fetches the ticket from Apple's CloudKit; that fetch drops now and then
+            # ("The network connection was lost", exit 68), so try a few times before giving up.
+            for try in 1 2 3 4 5 6; do
+              if xcrun stapler staple "$dmg"; then break; fi
+              [ "$try" = 6 ] && { echo "stapling failed six times"; exit 1; }
+              echo "staple try $try failed, waiting 30 s"; sleep 30
+            done
             spctl -a -t open --context context:primary-signature -vv "$dmg"
             echo "$dmg" >> "$RUNNER_TEMP/dmgs.txt"
           done < <(find src-tauri/target -path '*/bundle/dmg/*.dmg' -type f)
