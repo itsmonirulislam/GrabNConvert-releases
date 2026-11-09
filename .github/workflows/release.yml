@@ -28,6 +28,10 @@ on:
       tag:
         description: "Finish this release: notes, latest.json, publish (e.g. v1.0.5)"
         required: true
+      r2_only:
+        description: "Only mirror that (already published) release to Cloudflare R2"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -237,7 +241,7 @@ jobs:
   # are really there (the three platform jobs race on it).
   feed:
     needs: build
-    if: always() && ((github.event_name == 'push' && startsWith(github.ref_name, 'v') && needs.build.result == 'success') || github.event_name == 'workflow_dispatch')
+    if: always() && ((github.event_name == 'push' && startsWith(github.ref_name, 'v') && needs.build.result == 'success') || (github.event_name == 'workflow_dispatch' && !inputs.r2_only))
     runs-on: ubuntu-latest
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
@@ -275,3 +279,35 @@ jobs:
             | curl -sf -X PATCH -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" --data-binary @- "$api/releases/$REL_ID" >/dev/null
           echo "release $TAG published (id $REL_ID)"
           curl -sfL "https://github.com/${{ github.repository }}/releases/latest/download/latest.json" | jq -r '"update feed now says " + .version'
+
+  # Fast downloads: the installers, updater bundles and a latest.json with R2 URLs go to the
+  # Cloudflare R2 bucket behind dl.grabnconvert.com (scripts/r2-mirror.sh in the source). GitHub
+  # keeps every file and stays the fallback. Runs after a successful feed job, or alone from
+  # Actions → Run workflow with "r2_only" for a release that is already published. Skips itself
+  # quietly while the R2_* secrets are not set.
+  mirror:
+    needs: feed
+    if: always() && (needs.feed.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.r2_only))
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_PUBLIC_BASE: ${{ secrets.R2_PUBLIC_BASE }}
+    steps:
+      - name: Source scripts (private repo, read-only key)
+        if: env.R2_ACCOUNT_ID != ''
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: main
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+
+      - name: Mirror the release to Cloudflare R2
+        run: |
+          set -euo pipefail
+          if [ -z "$R2_ACCOUNT_ID" ]; then echo "no R2 secrets: GitHub downloads only"; exit 0; fi
+          scripts/r2-mirror.sh "$TAG"
