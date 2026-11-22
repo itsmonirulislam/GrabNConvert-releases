@@ -145,7 +145,12 @@ jobs:
       - name: Unit + end-to-end tests (Rust, real engines, no network)
         working-directory: src-tauri
         shell: bash
-        run: cargo test --lib --test ffmpeg_real --test queue_real $EDITION_CARGO_ARGS
+        # tauri-build checks that every bundled file exists. The edition's overlay leaves out the
+        # engines that edition does not ship, so the tests get it too, the way `tauri build --config`
+        # hands it over (TAURI_CONFIG). Without it Windows failed on the missing deno.exe/whisper-cli.exe.
+        run: |
+          if [ -f tauri.edition.json ]; then export TAURI_CONFIG="$(cat tauri.edition.json)"; fi
+          cargo test --lib --test ffmpeg_real --test queue_real $EDITION_CARGO_ARGS
 
       # Mac: Developer ID. Tauri signs and notarises the app but leaves bundle.resources unsigned,
       # so the engines are signed here first (scripts/sign-engines.mjs in the source). The APPLE_*
