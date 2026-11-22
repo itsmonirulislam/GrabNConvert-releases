@@ -1,4 +1,8 @@
 # Build GrabNConvert for macOS (Apple Silicon, Intel) and Windows and publish the release here.
+# From 1.1.0 every release holds two apps (docs/editions.md in the source): GrabNConvert (the paid
+# "pro" edition, same bundle id and feed as before, so installed apps update into it) and the free
+# GrabNConvert Downloader (its own bundle id, assets named GrabNConvert.Downloader_*, its own feed
+# latest-downloader.json).
 # It runs in this public repo because GitHub-hosted runners are free for public repos; the app's
 # source stays private and is checked out with a read-only deploy key (secret SOURCE_DEPLOY_KEY).
 # Build logs are public; they hold compiler output, never the source or a secret.
@@ -63,7 +67,7 @@ jobs:
           id=$(curl -sf -H "$auth" "$api/releases?per_page=50" | jq -r --arg t "$TAG" '[.[] | select(.tag_name == $t)][0].id // empty')
           if [ -z "$id" ]; then
             version="${TAG#v}"
-            body="Installers for macOS (Apple Silicon and Intel) and Windows. Installed apps update by themselves."
+            body="GrabNConvert and the free GrabNConvert Downloader for macOS (Apple Silicon and Intel) and Windows. Installed apps update by themselves."
             id=$(curl -sf -X POST -H "$auth" "$api/releases" -d "{\"tag_name\":\"$TAG\",\"name\":\"GrabNConvert $version\",\"body\":\"$body\",\"draft\":true,\"prerelease\":false}" | jq -r .id)
           fi
           echo "release id $id"
@@ -79,12 +83,27 @@ jobs:
         include:
           - os: macos-15
             platform: macos-arm64
+            edition: pro
             args: --config src-tauri/tauri.macos-arm64.conf.json
           - os: macos-15
             platform: macos-x64
+            edition: pro
             args: --target x86_64-apple-darwin --config src-tauri/tauri.macos-x64.conf.json
           - os: windows-latest
             platform: windows-x64
+            edition: pro
+            args: ""
+          - os: macos-15
+            platform: macos-arm64
+            edition: downloader
+            args: --config src-tauri/tauri.macos-arm64.conf.json
+          - os: macos-15
+            platform: macos-x64
+            edition: downloader
+            args: --target x86_64-apple-darwin --config src-tauri/tauri.macos-x64.conf.json
+          - os: windows-latest
+            platform: windows-x64
+            edition: downloader
             args: ""
     runs-on: ${{ matrix.os }}
     steps:
@@ -111,15 +130,22 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # The edition's Tauri config overlay (name, id, icons, engines, feed) and cargo features, from
+      # scripts/editions.mjs in the source. Sets VITE_GNC_EDITION, EDITION_TAURI_ARGS, EDITION_CARGO_ARGS.
+      - name: Edition (${{ matrix.edition }})
+        shell: bash
+        run: node scripts/editions.mjs ${{ matrix.edition }} ${{ matrix.platform }} --github-env --move-plist >> "$GITHUB_ENV"
+
       - name: Fetch and verify media engines
-        run: node scripts/prepare-engines.mjs --platform ${{ matrix.platform }}
+        run: node scripts/prepare-engines.mjs --platform ${{ matrix.platform }} --edition ${{ matrix.edition }}
 
       - name: Unit tests (frontend)
         run: npm test
 
       - name: Unit + end-to-end tests (Rust, real engines, no network)
         working-directory: src-tauri
-        run: cargo test --lib --test ffmpeg_real --test queue_real
+        shell: bash
+        run: cargo test --lib --test ffmpeg_real --test queue_real $EDITION_CARGO_ARGS
 
       # Mac: Developer ID. Tauri signs and notarises the app but leaves bundle.resources unsigned,
       # so the engines are signed here first (scripts/sign-engines.mjs in the source). The APPLE_*
@@ -168,7 +194,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          npx tauri build ${{ matrix.args }}
+          npx tauri build ${{ matrix.args }} $EDITION_TAURI_ARGS
           ls -R src-tauri/target/release/bundle src-tauri/target/*/release/bundle 2>/dev/null | grep -E "\.(dmg|exe|tar\.gz|sig|app)$" || true
 
       - name: Build, sign and upload to the draft release
@@ -182,8 +208,9 @@ jobs:
           owner: itsmonirulislam
           repo: GrabNConvert-releases
           releaseId: ${{ needs.prepare.outputs.id }}
-          includeUpdaterJson: true
-          args: ${{ matrix.args }}
+          # The feed job writes both feeds (two apps would overwrite each other's latest.json here).
+          includeUpdaterJson: false
+          args: ${{ matrix.args }} ${{ env.EDITION_TAURI_ARGS }}
 
       # Tauri notarises the app inside the DMG but not the DMG itself. Apple asks for the disk image
       # to be notarised too, so each DMG goes to the notary, gets its ticket stapled, and (for a
@@ -229,7 +256,8 @@ jobs:
           api=https://api.github.com/repos/${{ github.repository }}
           auth="Authorization: Bearer $GH_TOKEN"
           while IFS= read -r dmg; do
-            name=$(basename "$dmg")
+            # GitHub turns spaces in asset names into dots ("GrabNConvert Downloader_…" → "GrabNConvert.Downloader_…").
+            name=$(basename "$dmg" | tr ' ' '.')
             old=$(curl -sf -H "$auth" "$api/releases/$RELEASE_ID/assets?per_page=100" | jq -r --arg n "$name" '.[] | select(.name == $n) | .id')
             if [ -n "$old" ]; then curl -sf -X DELETE -H "$auth" "$api/releases/assets/$old"; fi
             curl -sf -X POST -H "$auth" -H "Content-Type: application/x-apple-diskimage" --data-binary @"$dmg" \
@@ -270,6 +298,13 @@ jobs:
 
       - name: Rebuild latest.json from the release assets
         run: scripts/updater-feed.sh "$TAG"
+
+      - name: The Downloader's feed (latest-downloader.json), when the release has it
+        run: |
+          set -euo pipefail
+          has=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/releases/$REL_ID/assets?per_page=100" | jq '[.[] | select(.name | startswith("GrabNConvert.Downloader_"))] | length')
+          if [ "$has" = "0" ]; then echo "no Downloader in $TAG"; exit 0; fi
+          PRODUCT=GrabNConvert.Downloader FEED=latest-downloader.json scripts/updater-feed.sh "$TAG"
 
       - name: Publish the release (it was a draft until every asset was in)
         run: |
